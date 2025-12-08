@@ -20,8 +20,6 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // ==========================================
 // ★ VIPスレッド設定
 // ==========================================
-// Bluetoothスレッド(Prio -10等)よりも優先される強力な設定
-// K_PRIO_COOP(1) = 協調スレッド優先度1 (数字が小さいほど強い)
 #define PMW3610_THREAD_PRIORITY K_PRIO_COOP(1)
 #define PMW3610_THREAD_STACK_SIZE 1024
 
@@ -371,8 +369,8 @@ static int pmw3610_report_data(const struct device *dev) {
 
     if (unlikely(!data->ready)) { return -EBUSY; }
 
-    // ★ 高速化ポイント: SPI通信の準備を static 化して、
-    // 毎回のメモリ初期化コスト(CPUサイクル)を削減
+    // ★ 高速化ポイント: static 化してCPU初期化コスト削減
+    // 変数名を rx_buf_set に変更して名前衝突を回避
     static uint8_t burst_addr = PMW3610_REG_MOTION_BURST;
     static const struct spi_buf tx_buf = { .buf = &burst_addr, .len = 1 };
     static const struct spi_buf_set tx = { .buffers = &tx_buf, .count = 1 };
@@ -381,10 +379,10 @@ static int pmw3610_report_data(const struct device *dev) {
         { .buf = NULL, .len = 1 },
         { .buf = buf, .len = PMW3610_BURST_SIZE }
     };
-    const struct spi_buf_set rx = { .buffers = rx_buf, .count = 2 };
+    const struct spi_buf_set rx_set = { .buffers = rx_buf, .count = 2 };
 
     // SPI通信実行
-    int err = spi_transceive_dt(&config->spi, &tx, &rx);
+    int err = spi_transceive_dt(&config->spi, &tx, &rx_set);
     if (err) { return err; }
 
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
@@ -395,7 +393,6 @@ static int pmw3610_report_data(const struct device *dev) {
     // スマートアルゴリズムがOFFなら、ここでの条件分岐も無駄なので#ifdefで囲って消滅させます
 #ifdef CONFIG_PMW3610_SMART_ALGORITHM
     if (data->sw_smart_flag) {
-        // ... (スマートアルゴリズム有効時の処理)
         int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
         if (data->sw_smart_flag && shutter < 45) {
             pmw3610_write(dev, 0x32, 0x00);
@@ -427,22 +424,23 @@ static int pmw3610_report_data(const struct device *dev) {
     if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) { return 0; }
     last_rpt_time = now;
 #else
-    // インターバル制限なしの場合 (通常はこちらが速い)
+    // インターバル制限なしの場合
     int16_t dx = x;
     int16_t dy = y;
 #endif
 
-    int16_t rx = (int16_t)CLAMP(dx, INT16_MIN, INT16_MAX);
-    int16_t ry = (int16_t)CLAMP(dy, INT16_MIN, INT16_MAX);
-    bool have_x = rx != 0;
-    bool have_y = ry != 0;
+    // 変数名を val_x, val_y に変更して衝突回避
+    int16_t val_x = (int16_t)CLAMP(dx, INT16_MIN, INT16_MAX);
+    int16_t val_y = (int16_t)CLAMP(dy, INT16_MIN, INT16_MAX);
+    bool have_x = val_x != 0;
+    bool have_y = val_y != 0;
 
     if (have_x || have_y) {
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
         dx = 0; dy = 0;
 #endif
-        if (have_x) { input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT); }
-        if (have_y) { input_report(dev, config->evt_type, config->y_input_code, ry, true, K_NO_WAIT); }
+        if (have_x) { input_report(dev, config->evt_type, config->x_input_code, val_x, !have_y, K_NO_WAIT); }
+        if (have_y) { input_report(dev, config->evt_type, config->y_input_code, val_y, true, K_NO_WAIT); }
     }
     return err;
 }
