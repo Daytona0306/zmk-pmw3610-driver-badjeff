@@ -359,26 +359,32 @@ static int pmw3610_async_init_configure(const struct device *dev) {
 }
 
 // -----------------------------------------------------------------------------
-// ★ 専用スレッド実装
+// ★ 専用スレッド実装 (static最適化版)
 // -----------------------------------------------------------------------------
 
 static int pmw3610_report_data(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
+    
+    // データ受け取り用バッファ
     uint8_t buf[PMW3610_BURST_SIZE];
 
     if (unlikely(!data->ready)) { return -EBUSY; }
 
-    static int64_t dx = 0;
-    static int64_t dy = 0;
+    // ★ 高速化ポイント: SPI通信の準備を static 化して、
+    // 毎回のメモリ初期化コスト(CPUサイクル)を削減
+    static uint8_t burst_addr = PMW3610_REG_MOTION_BURST;
+    static const struct spi_buf tx_buf = { .buf = &burst_addr, .len = 1 };
+    static const struct spi_buf_set tx = { .buffers = &tx_buf, .count = 1 };
+    
+    struct spi_buf rx_buf[] = {
+        { .buf = NULL, .len = 1 },
+        { .buf = buf, .len = PMW3610_BURST_SIZE }
+    };
+    const struct spi_buf_set rx = { .buffers = rx_buf, .count = 2 };
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-    static int64_t last_smp_time = 0;
-    static int64_t last_rpt_time = 0;
-    int64_t now = k_uptime_get();
-#endif
-
-    int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, PMW3610_BURST_SIZE);
+    // SPI通信実行
+    int err = spi_transceive_dt(&config->spi, &tx, &rx);
     if (err) { return err; }
 
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
@@ -386,30 +392,44 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t x = TOINT16((buf[PMW3610_X_L_POS] + ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
 
+    // スマートアルゴリズムがOFFなら、ここでの条件分岐も無駄なので#ifdefで囲って消滅させます
 #ifdef CONFIG_PMW3610_SMART_ALGORITHM
-    int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
-    if (data->sw_smart_flag && shutter < 45) {
-        pmw3610_write(dev, 0x32, 0x00);
-        data->sw_smart_flag = false;
-    }
-    if (!data->sw_smart_flag && shutter > 45) {
-        pmw3610_write(dev, 0x32, 0x80);
-        data->sw_smart_flag = true;
+    if (data->sw_smart_flag) {
+        // ... (スマートアルゴリズム有効時の処理)
+        int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
+        if (data->sw_smart_flag && shutter < 45) {
+            pmw3610_write(dev, 0x32, 0x00);
+            data->sw_smart_flag = false;
+        }
+        if (!data->sw_smart_flag && shutter > 45) {
+            pmw3610_write(dev, 0x32, 0x80);
+            data->sw_smart_flag = true;
+        }
     }
 #endif
 
+    // 前回の差分クリアなどの処理 (REPORT_INTERVAL_MIN使用時)
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+    static int64_t last_smp_time = 0;
+    static int64_t last_rpt_time = 0;
+    static int64_t dx = 0;
+    static int64_t dy = 0;
+    int64_t now = k_uptime_get();
+
     if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
         dx = 0; dy = 0;
     }
     last_smp_time = now;
-#endif
-
+    
     dx += x;
     dy += y;
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
     if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) { return 0; }
+    last_rpt_time = now;
+#else
+    // インターバル制限なしの場合 (通常はこちらが速い)
+    int16_t dx = x;
+    int16_t dy = y;
 #endif
 
     int16_t rx = (int16_t)CLAMP(dx, INT16_MIN, INT16_MAX);
@@ -419,9 +439,8 @@ static int pmw3610_report_data(const struct device *dev) {
 
     if (have_x || have_y) {
 #if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-        last_rpt_time = now;
-#endif
         dx = 0; dy = 0;
+#endif
         if (have_x) { input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT); }
         if (have_y) { input_report(dev, config->evt_type, config->y_input_code, ry, true, K_NO_WAIT); }
     }
