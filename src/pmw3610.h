@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* Timings (in us) used in SPI communication. */
-#define T_CLOCK_ON_DELAY_US 300
+#define T_CLOCK_ON_DELAY_US 40
 
 /* Sensor registers (addresses) */
 #define PMW3610_REG_PRODUCT_ID 0x00
